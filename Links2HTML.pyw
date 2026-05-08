@@ -8,13 +8,13 @@ from bs4 import BeautifulSoup
 import mammoth
 from pptx import Presentation
 
-# Wyrażenie regularne wyłapujące surowe linki (http/https) w zwykłym tekście
+# Regular expression catching raw links (http/https) in plain text
 URL_REGEX = re.compile(r'(https?://[^\s<()\"\']+)')
 
 class DocumentToHtmlConverter(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Konwerter Linków: Word & PowerPoint -> HTML (Dark Theme)")
+        self.setWindowTitle("Link Converter: Word & PowerPoint -> HTML (Dark Theme)")
         self.resize(1000, 600)
         
         self.init_ui()
@@ -25,12 +25,12 @@ class DocumentToHtmlConverter(QMainWindow):
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
 
-        # --- Panel przycisków (Góra) ---
+        # --- Button panel (Top) ---
         btn_layout = QHBoxLayout()
         
-        self.btn_load = QPushButton("Wczytaj plik (Word / PowerPoint)")
-        self.btn_paste = QPushButton("Wklej ze schowka")
-        self.btn_copy = QPushButton("Kopiuj wynikowy HTML")
+        self.btn_load = QPushButton("Load file (Word / PowerPoint)")
+        self.btn_paste = QPushButton("Paste from clipboard")
+        self.btn_copy = QPushButton("Copy resulting HTML")
 
         self.btn_load.clicked.connect(self.load_file)
         self.btn_paste.clicked.connect(self.paste_from_clipboard)
@@ -42,21 +42,21 @@ class DocumentToHtmlConverter(QMainWindow):
         
         main_layout.addLayout(btn_layout)
 
-        # --- Panel tekstowy (Dół - 2 kolumny) ---
+        # --- Text panel (Bottom - 2 columns) ---
         text_layout = QHBoxLayout()
 
-        # Lewa strona: Podgląd i Drag & Drop
+        # Left side: Preview and Drag & Drop
         left_layout = QVBoxLayout()
-        left_label = QLabel("Podgląd (Możesz tu upuścić tekst lub wczytać plik):")
+        left_label = QLabel("Preview (You can drop text here or load a file):")
         self.preview_area = QTextEdit()
         self.preview_area.textChanged.connect(self.process_content)
         
         left_layout.addWidget(left_label)
         left_layout.addWidget(self.preview_area)
 
-        # Prawa strona: Wynikowy kod HTML
+        # Right side: Resulting HTML code
         right_layout = QVBoxLayout()
-        right_label = QLabel("Skonwertowany kod HTML:")
+        right_label = QLabel("Converted HTML code:")
         self.result_area = QPlainTextEdit()
         self.result_area.setReadOnly(True) 
         
@@ -108,9 +108,9 @@ class DocumentToHtmlConverter(QMainWindow):
         self.setStyleSheet(dark_stylesheet)
 
     def load_file(self):
-        """Wczytuje plik .docx lub .pptx i odpowiednio go procesuje"""
+        """Loads a .docx or .pptx file and processes it accordingly"""
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Wybierz plik", "", "Dokumenty (*.docx *.pptx)"
+            self, "Select file", "", "Documents (*.docx *.pptx)"
         )
         if not file_path:
             return
@@ -126,28 +126,28 @@ class DocumentToHtmlConverter(QMainWindow):
                 self.preview_area.setHtml(html_content)
                 
         except Exception as e:
-            QMessageBox.critical(self, "Błąd", f"Nie udało się wczytać pliku:\n{str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to load file:\n{str(e)}")
 
     def parse_pptx(self, file_path):
-        """Wyciąga tekst i hiperłącza z pól tekstowych prezentacji PowerPoint"""
+        """Extracts text and hyperlinks from PowerPoint text frames"""
         prs = Presentation(file_path)
         html_output = ""
 
-        # Przelatujemy przez wszystkie slajdy
+        # Iterate through all slides
         for slide in prs.slides:
-            # Przelatujemy przez wszystkie kształty (pola tekstowe, tabele itp.)
+            # Iterate through all shapes (text boxes, tables, etc.)
             for shape in slide.shapes:
                 if not shape.has_text_frame:
                     continue
                 
-                # Zbieramy paragrafy z pola tekstowego
+                # Collect paragraphs from the text frame
                 for paragraph in shape.text_frame.paragraphs:
                     p_html = ""
                     for run in paragraph.runs:
                         text = html.escape(run.text)
-                        # Sprawdzamy czy dany fragment tekstu ma podpięte hiperłącze
+                        # Check if the given text fragment has an attached hyperlink
                         if run.hyperlink and run.hyperlink.address:
-                            # ZABEZPIECZENIE: Ucieczka znaków specjalnych w URL (np. cudzysłowów)
+                            # SAFEGUARD: Escape special characters in URL (e.g., quotes)
                             address = html.escape(run.hyperlink.address, quote=True)
                             p_html += f'<a href="{address}">{text}</a>'
                         else:
@@ -163,18 +163,18 @@ class DocumentToHtmlConverter(QMainWindow):
 
     def copy_result(self):
         QApplication.clipboard().setText(self.result_area.toPlainText())
-        QMessageBox.information(self, "Sukces", "Kod HTML został skopiowany do schowka!")
+        QMessageBox.information(self, "Success", "HTML code copied to clipboard!")
 
     def process_content(self):
-        """Parsuje kod z podglądu na czysty HTML"""
+        """Parses the preview code into clean HTML"""
         raw_html = self.preview_area.toHtml()
         soup = BeautifulSoup(raw_html, 'html.parser')
         
         body = soup.body if soup.body else soup
 
-        # Zamiana surowych linków tekstowych na tagi <a>
+        # Convert raw text links into <a> tags
         for text_node in body.find_all(string=True):
-            # POPRAWKA 1: Sprawdzamy wszystkich przodków, bo QTextEdit dodaje tagi <span>
+            # FIX 1: Check all ancestors because QTextEdit adds <span> tags
             if text_node.find_parent('a'):
                 continue
 
@@ -185,10 +185,10 @@ class DocumentToHtmlConverter(QMainWindow):
                     new_soup = BeautifulSoup(replaced_text, 'html.parser')
                     text_node.replace_with(new_soup)
 
-        # Oczyszczanie struktury - zostawiamy tylko same linki wewnątrz paragrafów
+        # Clean up structure - leave only links inside paragraphs
         result_text = ""
         for block in body.find_all(['p', 'div', 'li', 'h1', 'h2', 'h3']):
-            # POPRAWKA 2: Zbieramy tagi do listy, aby bezpiecznie modyfikować drzewo
+            # FIX 2: Collect tags into a list to safely modify the tree
             tags_to_unwrap = [tag for tag in block.find_all(True) if tag.name != 'a']
             for tag in tags_to_unwrap:
                 tag.unwrap()
