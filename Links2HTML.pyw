@@ -118,7 +118,14 @@ class DocumentToHtmlConverter(QMainWindow):
         try:
             if file_path.endswith('.docx'):
                 with open(file_path, "rb") as docx_file:
-                    result = mammoth.convert_to_html(docx_file)
+                    # Map bold → <b>, italic → <i>, underline → <u>
+                    # All three can coexist (mammoth wraps them independently).
+                    style_map = (
+                        "b => b\n"
+                        "i => i\n"
+                        "u => u"
+                    )
+                    result = mammoth.convert_to_html(docx_file, style_map=style_map)
                     self.preview_area.setHtml(result.value)
  
             elif file_path.endswith('.pptx'):
@@ -129,30 +136,44 @@ class DocumentToHtmlConverter(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to load file:\n{str(e)}")
  
     def parse_pptx(self, file_path):
-        """Extracts text and hyperlinks from PowerPoint text frames"""
+        """Extracts text, hyperlinks and formatting from PowerPoint text frames"""
         prs = Presentation(file_path)
         html_output = ""
- 
+
         for slide in prs.slides:
             for shape in slide.shapes:
                 if not shape.has_text_frame:
                     continue
- 
+
                 for paragraph in shape.text_frame.paragraphs:
                     p_html = ""
                     for run in paragraph.runs:
                         text = html.escape(run.text)
-                        if run.hyperlink and run.hyperlink.address:
-                            # MODYFIKACJA: Usuwamy przecinki i średniki z końca adresu
+
+                        # Wrap each formatting tag independently so they can stack:
+                        # e.g. bold + underline → <b><u>text</u></b>
+                        # Note: <u> is skipped for hyperlinks — browsers underline
+                        # <a> elements by default, so it would be redundant.
+                        font = run.font
+                        is_link = bool(run.hyperlink and run.hyperlink.address)
+                        if font.underline and not is_link:
+                            text = f"<u>{text}</u>"
+                        if font.italic:
+                            text = f"<i>{text}</i>"
+                        if font.bold:
+                            text = f"<b>{text}</b>"
+
+                        if is_link:
                             clean_address = run.hyperlink.address.rstrip(',;.:')
                             address = html.escape(clean_address, quote=True)
                             p_html += f'<a href="{address}">{text}</a>'
                         else:
                             p_html += text
- 
+
+
                     if p_html.strip():
                         html_output += f"<p>{p_html}</p>\n"
- 
+
         return html_output
  
     def paste_from_clipboard(self):
@@ -166,39 +187,95 @@ class DocumentToHtmlConverter(QMainWindow):
         """Parses the preview code into clean HTML"""
         raw_html = self.preview_area.toHtml()
         soup = BeautifulSoup(raw_html, 'html.parser')
- 
+
         body = soup.body if soup.body else soup
- 
+
+        # --- Step 1: Normalise Qt inline styles into semantic b/i/u tags ---
+        # Qt encodes bold/italic/underline as inline CSS on <span> elements.
+        # A single span can carry multiple styles at once, so we check all three
+        # independently (no elif) and wrap the content in the appropriate tags.
+        for span in body.find_all('span'):
+            style = span.get('style', '')
+
+            is_bold = ('font-weight:600' in style or 'font-weight: 600' in style or
+                       'font-weight:700' in style or 'font-weight: 700' in style or
+                       'font-weight:bold' in style or 'font-weight: bold' in style)
+            is_italic = ('font-style:italic' in style or 'font-style: italic' in style)
+            is_underline = ('text-decoration:underline' in style or
+                            'text-decoration: underline' in style)
+
+            if not (is_bold or is_italic or is_underline):
+                continue
+
+            # Collect the span's children, then wrap them in layers: u → i → b
+            # (innermost first so the outermost tag is the first one readers see)
+            children = list(span.contents)
+
+            if is_underline:
+                u_tag = soup.new_tag('u')
+                for child in children:
+                    u_tag.append(child.__copy__() if hasattr(child, '__copy__') else child)
+                children = [u_tag]
+
+            if is_italic:
+                i_tag = soup.new_tag('i')
+                for child in children:
+                    i_tag.append(child)
+                children = [i_tag]
+
+            if is_bold:
+                b_tag = soup.new_tag('b')
+                for child in children:
+                    b_tag.append(child)
+                children = [b_tag]
+
+            span.replace_with(children[0])
+
+        # Also convert any <strong> or <em> that mammoth / other sources may have
+        # emitted, so the output is consistently <b>/<i>.
+        for strong in body.find_all('strong'):
+            strong.name = 'b'
+        for em in body.find_all('em'):
+            em.name = 'i'
+
+        # --- Step 1b: Strip redundant <u> inside <a> ---
+        # Browsers underline anchor elements by default, so <u> inside <a> is
+        # purely noise.  Unwrap every <u> that has an <a> ancestor.
+        for u_tag in body.find_all('u'):
+            if u_tag.find_parent('a'):
+                u_tag.unwrap()
+
+        # --- Step 2: Convert raw http URLs in text nodes into <a> links ---
         for text_node in body.find_all(string=True):
             if text_node.find_parent('a'):
                 continue
- 
+
             original_text = str(text_node)
             if 'http' in original_text:
-                # MODYFIKACJA: Używamy funkcji zamiany, aby "oczyścić" każdy znaleziony link
                 def clean_url_match(match):
                     full_url = match.group(1)
-                    # Usuwamy znaki interpunkcyjne z końca adresu URL
                     clean_url = full_url.rstrip(',;.:')
                     return f'<a href="{clean_url}">{full_url}</a>'
- 
+
                 replaced_text = URL_REGEX.sub(clean_url_match, original_text)
- 
+
                 if replaced_text != original_text:
                     new_soup = BeautifulSoup(replaced_text, 'html.parser')
                     text_node.replace_with(new_soup)
- 
-        # Clean up structure - leave only links inside paragraphs
+
+        # --- Step 3: Build clean output — keep <a>, <b>, <i>, <u> ---
+        KEEP_TAGS = {'a', 'b', 'i', 'u'}
         result_text = ""
         for block in body.find_all(['p', 'div', 'li', 'h1', 'h2', 'h3']):
-            tags_to_unwrap = [tag for tag in block.find_all(True) if tag.name != 'a']
+            tags_to_unwrap = [tag for tag in block.find_all(True)
+                              if tag.name not in KEEP_TAGS]
             for tag in tags_to_unwrap:
                 tag.unwrap()
- 
+
             block_html = "".join(str(c) for c in block.contents).strip()
             if block_html:
                 result_text += block_html + "\n\n"
- 
+
         self.result_area.setPlainText(result_text.strip())
  
 if __name__ == "__main__":
