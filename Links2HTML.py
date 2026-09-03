@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from bs4 import BeautifulSoup
 import mammoth
 from pptx import Presentation
+from pptx.oxml.ns import qn
  
 # Regular expression catching raw links (http/https) in plain text
 URL_REGEX = re.compile(r'(https?://[^\s<()\"\']+)')
@@ -20,10 +21,10 @@ EXISTING_LINK_REGEX = re.compile(
     re.IGNORECASE | re.DOTALL
 )
 
-# Regular expression catching literal formatting tags (b/i/u/strong/em) that
-# may appear as plain text (e.g. pasted raw HTML), so we know when a text
+# Regular expression catching literal formatting tags (b/i/u/strong/em/sub/sup)
+# that may appear as plain text (e.g. pasted raw HTML), so we know when a text
 # node needs to be re-parsed as real HTML rather than left as escaped text.
-FORMATTING_TAG_REGEX = re.compile(r'</?(?:b|i|u|strong|em)\b[^>]*>', re.IGNORECASE)
+FORMATTING_TAG_REGEX = re.compile(r'</?(?:b|i|u|strong|em|sub|sup)\b[^>]*>', re.IGNORECASE)
  
 class DocumentToHtmlConverter(QMainWindow):
     def __init__(self):
@@ -137,7 +138,9 @@ class DocumentToHtmlConverter(QMainWindow):
                     style_map = (
                         "b => b\n"
                         "i => i\n"
-                        "u => u"
+                        "u => u\n"
+                        "vertical-align('superscript') => sup\n"
+                        "vertical-align('subscript') => sub"
                     )
                     result = mammoth.convert_to_html(docx_file, style_map=style_map)
                     self.preview_area.setHtml(result.value)
@@ -170,6 +173,19 @@ class DocumentToHtmlConverter(QMainWindow):
                         # <a> elements by default, so it would be redundant.
                         font = run.font
                         is_link = bool(run.hyperlink and run.hyperlink.address)
+
+                        # python-pptx has no direct superscript/subscript API,
+                        # so read the raw <a:rPr baseline="..."/> attribute:
+                        # positive baseline => superscript, negative => subscript.
+                        rPr = run._r.find(qn('a:rPr'))
+                        baseline = rPr.get('baseline') if rPr is not None else None
+                        is_superscript = baseline is not None and int(baseline) > 0
+                        is_subscript = baseline is not None and int(baseline) < 0
+
+                        if is_superscript:
+                            text = f"<sup>{text}</sup>"
+                        if is_subscript:
+                            text = f"<sub>{text}</sub>"
                         if font.underline and not is_link:
                             text = f"<u>{text}</u>"
                         if font.italic:
@@ -217,13 +233,30 @@ class DocumentToHtmlConverter(QMainWindow):
             is_italic = ('font-style:italic' in style or 'font-style: italic' in style)
             is_underline = ('text-decoration:underline' in style or
                             'text-decoration: underline' in style)
+            is_superscript = ('vertical-align:super' in style or
+                              'vertical-align: super' in style)
+            is_subscript = ('vertical-align:sub' in style or
+                            'vertical-align: sub' in style)
 
-            if not (is_bold or is_italic or is_underline):
+            if not (is_bold or is_italic or is_underline or is_superscript or is_subscript):
                 continue
 
-            # Collect the span's children, then wrap them in layers: u → i → b
+            # Collect the span's children, then wrap them in layers:
+            # sup/sub → u → i → b
             # (innermost first so the outermost tag is the first one readers see)
             children = list(span.contents)
+
+            if is_superscript:
+                sup_tag = soup.new_tag('sup')
+                for child in children:
+                    sup_tag.append(child)
+                children = [sup_tag]
+
+            if is_subscript:
+                sub_tag = soup.new_tag('sub')
+                for child in children:
+                    sub_tag.append(child)
+                children = [sub_tag]
 
             if is_underline:
                 u_tag = soup.new_tag('u')
@@ -302,7 +335,7 @@ class DocumentToHtmlConverter(QMainWindow):
                 u_tag.unwrap()
 
         # --- Step 3: Build clean output — keep <a>, <b>, <i>, <u> ---
-        KEEP_TAGS = {'a', 'b', 'i', 'u'}
+        KEEP_TAGS = {'a', 'b', 'i', 'u', 'sub', 'sup'}
         result_text = ""
         for block in body.find_all(['p', 'div', 'li', 'h1', 'h2', 'h3']):
             tags_to_unwrap = [tag for tag in block.find_all(True)
