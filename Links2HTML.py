@@ -211,7 +211,7 @@ class DocumentToHtmlConverter(QMainWindow):
  
     def copy_result(self):
         QApplication.clipboard().setText(self.result_area.toPlainText())
-        QMessageBox.information(self, "Success", "HTML code copied to clipboard!")
+        #QMessageBox.information(self, "Success", "HTML code copied to clipboard!")
  
     def process_content(self):
         """Parses the preview code into clean HTML"""
