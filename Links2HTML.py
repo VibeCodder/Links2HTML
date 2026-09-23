@@ -3,10 +3,14 @@ import re
 import html
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QTextEdit, QPlainTextEdit, QPushButton,
-                             QFileDialog, QLabel, QMessageBox)
+                             QFileDialog, QLabel, QMessageBox, QDialog, QCheckBox)
+from PyQt6.QtGui import QIcon, QPixmap, QPainter
+from PyQt6.QtCore import QByteArray, Qt, QSize, QSettings
+from PyQt6.QtSvg import QSvgRenderer
 from bs4 import BeautifulSoup
 import mammoth
 from pptx import Presentation
+from pptx.enum.dml import MSO_COLOR_TYPE
 from pptx.oxml.ns import qn
  
 # Regular expression catching raw links (http/https) in plain text
@@ -25,12 +29,82 @@ EXISTING_LINK_REGEX = re.compile(
 # that may appear as plain text (e.g. pasted raw HTML), so we know when a text
 # node needs to be re-parsed as real HTML rather than left as escaped text.
 FORMATTING_TAG_REGEX = re.compile(r'</?(?:b|i|u|strong|em|sub|sup)\b[^>]*>', re.IGNORECASE)
- 
+
+# Catches the CSS "color" property inside a style attribute. The lookbehind makes
+# sure that "background-color" (or any other "*-color") is NOT matched.
+COLOR_STYLE_REGEX = re.compile(r'(?<![\w-])color\s*:\s*([^;"]+)', re.IGNORECASE)
+
+
+def is_color_span(tag):
+    """True for the <span style="color:..."> elements created by this app."""
+    return (tag.name == 'span'
+            and (tag.get('style') or '').startswith('color:'))
+
+
+def make_gear_icon(color="#ffffff", size=24):
+    """Builds a gear icon from an inline SVG (drawn as ring + 8 teeth, so the
+    centre hole is simply transparent) and returns it as a QIcon."""
+    teeth = "".join(
+        f'<rect x="10.5" y="1.5" width="3" height="4.5" rx="0.8" '
+        f'transform="rotate({angle} 12 12)"/>'
+        for angle in range(0, 360, 45)
+    )
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        f'<g fill="{color}">{teeth}</g>'
+        f'<circle cx="12" cy="12" r="5.75" fill="none" stroke="{color}" '
+        'stroke-width="3.5"/>'
+        '</svg>'
+    )
+    renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
+    pixmap = QPixmap(size * 2, size * 2)  # 2x for crisp rendering on HiDPI
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    renderer.render(painter)
+    painter.end()
+    return QIcon(pixmap)
+
+
+class SettingsDialog(QDialog):
+    """Small settings window with the app options as checkboxes."""
+
+    def __init__(self, parent, links_new_tab, detect_text_color):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.setModal(True)
+        self.setMinimumWidth(400)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        self.cb_new_tab = QCheckBox("Set links to be opened in new tab by default")
+        self.cb_new_tab.setChecked(links_new_tab)
+
+        self.cb_text_color = QCheckBox("Set app to recognize text color, excluding links")
+        self.cb_text_color.setChecked(detect_text_color)
+
+        layout.addWidget(self.cb_new_tab)
+        layout.addWidget(self.cb_text_color)
+        layout.addStretch()
+
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.accept)
+        layout.addWidget(btn_close)
+
+
 class DocumentToHtmlConverter(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Link Converter: Word & PowerPoint -> HTML (Dark Theme)")
         self.resize(1000, 600)
+
+        # --- Settings (both disabled by default, persisted via QSettings) ---
+        # type=bool is required: QSettings may return "true"/"false" strings
+        # (e.g. from an .ini backend), which would otherwise both be truthy.
+        self.qsettings = QSettings("Links2HTML", "Links2HTML")
+        self.links_new_tab = self.qsettings.value("links_new_tab", False, type=bool)
+        self.detect_text_color = self.qsettings.value("detect_text_color", False, type=bool)
  
         self.init_ui()
         self.apply_dark_theme()
@@ -46,14 +120,25 @@ class DocumentToHtmlConverter(QMainWindow):
         self.btn_load = QPushButton("Load file (Word / PowerPoint)")
         self.btn_paste = QPushButton("Paste from clipboard")
         self.btn_copy = QPushButton("Copy resulting HTML")
+
+        # Gear button (right side) - opens the settings window
+        self.btn_settings = QPushButton()
+        self.btn_settings.setObjectName("settingsBtn")
+        self.btn_settings.setIcon(make_gear_icon())
+        self.btn_settings.setIconSize(QSize(22, 22))
+        self.btn_settings.setFixedSize(40, 40)
+        self.btn_settings.setToolTip("Settings")
+        self.btn_settings.setCursor(Qt.CursorShape.PointingHandCursor)
  
         self.btn_load.clicked.connect(self.load_file)
         self.btn_paste.clicked.connect(self.paste_from_clipboard)
         self.btn_copy.clicked.connect(self.copy_result)
+        self.btn_settings.clicked.connect(self.open_settings)
  
         btn_layout.addWidget(self.btn_load)
         btn_layout.addWidget(self.btn_paste)
         btn_layout.addWidget(self.btn_copy)
+        btn_layout.addWidget(self.btn_settings)
  
         main_layout.addLayout(btn_layout)
  
@@ -85,7 +170,7 @@ class DocumentToHtmlConverter(QMainWindow):
  
     def apply_dark_theme(self):
         dark_stylesheet = """
-            QMainWindow, QWidget {
+            QMainWindow, QWidget, QDialog {
                 background-color: #2b2b2b;
                 color: #a9b7c6;
                 font-family: 'Segoe UI', Arial, sans-serif;
@@ -113,14 +198,41 @@ class DocumentToHtmlConverter(QMainWindow):
             QPushButton:pressed {
                 background-color: #27405e;
             }
+            QPushButton#settingsBtn {
+                padding: 0px;
+            }
             QLabel {
                 font-size: 13px;
                 font-weight: bold;
                 margin-bottom: 5px;
                 color: #cccccc;
             }
+            QCheckBox {
+                font-size: 13px;
+                color: #cccccc;
+                spacing: 8px;
+            }
         """
         self.setStyleSheet(dark_stylesheet)
+
+    # ------------------------------------------------------------------
+    # Settings
+    # ------------------------------------------------------------------
+    def open_settings(self):
+        dlg = SettingsDialog(self, self.links_new_tab, self.detect_text_color)
+        dlg.cb_new_tab.toggled.connect(self.set_links_new_tab)
+        dlg.cb_text_color.toggled.connect(self.set_detect_text_color)
+        dlg.exec()
+
+    def set_links_new_tab(self, checked):
+        self.links_new_tab = checked
+        self.qsettings.setValue("links_new_tab", checked)
+        self.process_content()  # refresh the result immediately
+
+    def set_detect_text_color(self, checked):
+        self.detect_text_color = checked
+        self.qsettings.setValue("detect_text_color", checked)
+        self.process_content()  # refresh the result immediately
  
     def load_file(self):
         """Loads a .docx or .pptx file and processes it accordingly"""
@@ -174,6 +286,16 @@ class DocumentToHtmlConverter(QMainWindow):
                         font = run.font
                         is_link = bool(run.hyperlink and run.hyperlink.address)
 
+                        # Explicit RGB text colour (links are excluded on purpose).
+                        # It is always written into the preview; process_content()
+                        # decides whether it ends up in the result (see Settings).
+                        if not is_link:
+                            try:
+                                if font.color and font.color.type == MSO_COLOR_TYPE.RGB:
+                                    text = f'<span style="color:#{font.color.rgb}">{text}</span>'
+                            except AttributeError:
+                                pass
+
                         # python-pptx has no direct superscript/subscript API,
                         # so read the raw <a:rPr baseline="..."/> attribute:
                         # positive baseline => superscript, negative => subscript.
@@ -213,6 +335,27 @@ class DocumentToHtmlConverter(QMainWindow):
         QApplication.clipboard().setText(self.result_area.toPlainText())
         #QMessageBox.information(self, "Success", "HTML code copied to clipboard!")
  
+    @staticmethod
+    def uniform_block_color(block):
+        """Returns the style string (e.g. "color:#ff0000") if ALL non-blank text
+        of the block sits inside colour spans of one and the same colour.
+        Returns None otherwise (mixed colours, uncoloured text, links, ...)."""
+        colors = set()
+        for text_node in block.find_all(string=True):
+            if not text_node.strip():
+                continue
+            color = None
+            for parent in text_node.parents:
+                if parent is block:
+                    break
+                if is_color_span(parent):
+                    color = parent['style']
+                    break
+            if color is None:
+                return None
+            colors.add(color)
+        return colors.pop() if len(colors) == 1 else None
+
     def process_content(self):
         """Parses the preview code into clean HTML"""
         raw_html = self.preview_area.toHtml()
@@ -238,13 +381,29 @@ class DocumentToHtmlConverter(QMainWindow):
             is_subscript = ('vertical-align:sub' in style or
                             'vertical-align: sub' in style)
 
-            if not (is_bold or is_italic or is_underline or is_superscript or is_subscript):
+            # Text colour (optional feature). Spans that sit inside a link are
+            # ignored, so links never get a colour of their own.
+            color_value = None
+            if self.detect_text_color and not span.find_parent('a'):
+                color_match = COLOR_STYLE_REGEX.search(style)
+                if color_match:
+                    color_value = color_match.group(1).strip()
+
+            if not (is_bold or is_italic or is_underline or
+                    is_superscript or is_subscript or color_value):
                 continue
 
             # Collect the span's children, then wrap them in layers:
-            # sup/sub → u → i → b
+            # color → sup/sub → u → i → b
             # (innermost first so the outermost tag is the first one readers see)
             children = list(span.contents)
+
+            if color_value:
+                color_tag = soup.new_tag('span')
+                color_tag['style'] = f"color:{color_value}"
+                for child in children:
+                    color_tag.append(child)
+                children = [color_tag]
 
             if is_superscript:
                 sup_tag = soup.new_tag('sup')
@@ -334,17 +493,54 @@ class DocumentToHtmlConverter(QMainWindow):
             if u_tag.find_parent('a'):
                 u_tag.unwrap()
 
+        # --- Step 2d: Keep colour away from links ---
+        # Step 2 may have created <a> tags (naked URLs) inside a coloured span.
+        # In that case the colour is re-applied to each text piece outside the
+        # link separately, and the original wrapping span is removed.
+        if self.detect_text_color:
+            for color_span in body.find_all(is_color_span):
+                if color_span.find('a') is None:
+                    continue
+                color_style = color_span['style']
+                for text_node in color_span.find_all(string=True):
+                    if text_node.find_parent('a') or not text_node.strip():
+                        continue
+                    wrapper = soup.new_tag('span')
+                    wrapper['style'] = color_style
+                    text_node.replace_with(wrapper)
+                    wrapper.append(text_node)
+                color_span.unwrap()
+
+        # --- Step 2e: Open links in a new tab (optional feature) ---
+        if self.links_new_tab:
+            for a_tag in body.find_all('a'):
+                a_tag['target'] = '_blank'
+
         # --- Step 3: Build clean output — keep <a>, <b>, <i>, <u> ---
+        # (plus colour spans created above, when the colour option is enabled)
         KEEP_TAGS = {'a', 'b', 'i', 'u', 'sub', 'sup'}
         result_text = ""
         for block in body.find_all(['p', 'div', 'li', 'h1', 'h2', 'h3']):
+            # If the WHOLE paragraph has one colour, the colour is moved from
+            # the <span>s to the paragraph itself: <p style="color:#...">...</p>.
+            # Mixed/partial colouring keeps inline <span>s (a <p> can't be
+            # placed in the middle of a sentence).
+            paragraph_style = None
+            if self.detect_text_color and block.name in ('p', 'div'):
+                paragraph_style = self.uniform_block_color(block)
+                if paragraph_style:
+                    for color_span in block.find_all(is_color_span):
+                        color_span.unwrap()
+
             tags_to_unwrap = [tag for tag in block.find_all(True)
-                              if tag.name not in KEEP_TAGS]
+                              if tag.name not in KEEP_TAGS and not is_color_span(tag)]
             for tag in tags_to_unwrap:
                 tag.unwrap()
 
             block_html = "".join(str(c) for c in block.contents).strip()
             if block_html:
+                if paragraph_style:
+                    block_html = f'<p style="{html.escape(paragraph_style, quote=True)}">{block_html}</p>'
                 result_text += block_html + "\n\n"
 
         self.result_area.setPlainText(result_text.strip())
