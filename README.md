@@ -1,5 +1,5 @@
 # Links2HTML
-A simple tool created in Google Gemini and Claude to convert MS Word and PowerPoint formated text with hyperlinks to HTML code.<br>
+A simple tool created in Google Gemini and Claude to convert MS Word and PowerPoint formated text and hyperlinks to HTML code.<br>
 It allows to paste, drag&drop and read documents.
 <br><br>
 Before running the program you must run this command to install required packages:<br>
