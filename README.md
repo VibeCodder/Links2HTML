@@ -7,5 +7,7 @@ Before running the program you must run this command to install required package
 pip install PyQt6 beautifulsoup4 mammoth python-pptx
 ```
 
-<img width="1920" height="1020" alt="python_QWXrb9mxTA" src="https://github.com/user-attachments/assets/b4341745-6d39-4969-85ff-c873722313f7" />
+<img width="1252" height="789" alt="image" src="https://github.com/user-attachments/assets/ca3d5f2c-0a75-42bf-9208-af88003050bf" />
+
+
 
