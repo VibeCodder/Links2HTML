@@ -1,10 +1,11 @@
+import os
 import sys
 import re
 import html
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QTextEdit, QPlainTextEdit, QPushButton,
                              QFileDialog, QLabel, QMessageBox, QDialog, QCheckBox)
-from PyQt6.QtGui import QIcon, QPixmap, QPainter
+from PyQt6.QtGui import QIcon, QPixmap, QPainter, QTextCursor, QColor
 from PyQt6.QtCore import QByteArray, Qt, QSize, QSettings
 from PyQt6.QtSvg import QSvgRenderer
 from bs4 import BeautifulSoup
@@ -13,6 +14,27 @@ from pptx import Presentation
 from pptx.enum.dml import MSO_COLOR_TYPE
 from pptx.oxml.ns import qn
  
+# Folder of the script (or of the .exe when frozen) - the "icons" folder lives next to it
+APP_DIR = os.path.dirname(sys.executable if getattr(sys, "frozen", False)
+                          else os.path.abspath(__file__))
+APP_ICON_PATH = os.path.join(APP_DIR, "icons", "Link2HTML(dark).ico")
+
+# Text colour used in the first (preview) window, regardless of the pasted content
+PREVIEW_TEXT_COLOR = "#a0a0a0"
+
+# What an empty line is converted to (when the option is enabled)
+EMPTY_LINE_HTML = "<br><br>"
+
+
+def load_app_icon():
+    """Returns the application icon from ./icons/Link2HTML(dark).ico
+    (an empty QIcon when the file is missing)."""
+    if not os.path.isfile(APP_ICON_PATH):
+        print(f"Warning: icon not found: {APP_ICON_PATH}", file=sys.stderr)
+        return QIcon()
+    return QIcon(APP_ICON_PATH)
+
+
 # Regular expression catching raw links (http/https) in plain text
 URL_REGEX = re.compile(r'(https?://[^\s<()\"\']+)')
 
@@ -69,7 +91,7 @@ def make_gear_icon(color="#ffffff", size=24):
 class SettingsDialog(QDialog):
     """Small settings window with the app options as checkboxes."""
 
-    def __init__(self, parent, links_new_tab, detect_text_color):
+    def __init__(self, parent, links_new_tab, detect_text_color, empty_line_br):
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.setModal(True)
@@ -84,8 +106,12 @@ class SettingsDialog(QDialog):
         self.cb_text_color = QCheckBox("Set app to recognize text color, excluding links")
         self.cb_text_color.setChecked(detect_text_color)
 
+        self.cb_empty_line_br = QCheckBox(f"Convert empty lines to {EMPTY_LINE_HTML}")
+        self.cb_empty_line_br.setChecked(empty_line_br)
+
         layout.addWidget(self.cb_new_tab)
         layout.addWidget(self.cb_text_color)
+        layout.addWidget(self.cb_empty_line_br)
         layout.addStretch()
 
         btn_close = QPushButton("Close")
@@ -97,14 +123,17 @@ class DocumentToHtmlConverter(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Link Converter: Word & PowerPoint -> HTML (Dark Theme)")
+        self.setWindowIcon(load_app_icon())
         self.resize(1000, 600)
 
-        # --- Settings (both disabled by default, persisted via QSettings) ---
+        # --- Settings (persisted via QSettings; the first two are disabled by
+        # default, the empty-line conversion is enabled by default) ---
         # type=bool is required: QSettings may return "true"/"false" strings
         # (e.g. from an .ini backend), which would otherwise both be truthy.
         self.qsettings = QSettings("Links2HTML", "Links2HTML")
         self.links_new_tab = self.qsettings.value("links_new_tab", False, type=bool)
         self.detect_text_color = self.qsettings.value("detect_text_color", False, type=bool)
+        self.empty_line_br = self.qsettings.value("empty_line_br", True, type=bool)
  
         self.init_ui()
         self.apply_dark_theme()
@@ -149,7 +178,8 @@ class DocumentToHtmlConverter(QMainWindow):
         left_layout = QVBoxLayout()
         left_label = QLabel("Preview (You can drop text here or load a file):")
         self.preview_area = QTextEdit()
-        self.preview_area.textChanged.connect(self.process_content)
+        self.preview_area.setObjectName("previewArea")
+        self.preview_area.textChanged.connect(self.on_preview_changed)
  
         left_layout.addWidget(left_label)
         left_layout.addWidget(self.preview_area)
@@ -183,6 +213,9 @@ class DocumentToHtmlConverter(QMainWindow):
                 padding: 8px;
                 font-size: 14px;
             }
+            QTextEdit#previewArea {
+                color: %s;
+            }
             QPushButton {
                 background-color: #365880;
                 color: #ffffff;
@@ -213,15 +246,18 @@ class DocumentToHtmlConverter(QMainWindow):
                 spacing: 8px;
             }
         """
-        self.setStyleSheet(dark_stylesheet)
+        self.setStyleSheet(dark_stylesheet % PREVIEW_TEXT_COLOR)
 
     # ------------------------------------------------------------------
     # Settings
     # ------------------------------------------------------------------
     def open_settings(self):
-        dlg = SettingsDialog(self, self.links_new_tab, self.detect_text_color)
+        dlg = SettingsDialog(self, self.links_new_tab, self.detect_text_color,
+                             self.empty_line_br)
+        dlg.setWindowIcon(self.windowIcon())
         dlg.cb_new_tab.toggled.connect(self.set_links_new_tab)
         dlg.cb_text_color.toggled.connect(self.set_detect_text_color)
+        dlg.cb_empty_line_br.toggled.connect(self.set_empty_line_br)
         dlg.exec()
 
     def set_links_new_tab(self, checked):
@@ -233,6 +269,27 @@ class DocumentToHtmlConverter(QMainWindow):
         self.detect_text_color = checked
         self.qsettings.setValue("detect_text_color", checked)
         self.process_content()  # refresh the result immediately
+
+    def set_empty_line_br(self, checked):
+        self.empty_line_br = checked
+        self.qsettings.setValue("empty_line_br", checked)
+        self.process_content()  # refresh the result immediately
+
+    def on_preview_changed(self):
+        self.force_preview_text_color()
+        self.process_content()
+
+    def force_preview_text_color(self):
+        """Displays ALL text of the preview window in grey, whatever colour the
+        pasted/loaded content has. Done with an "extra selection" (a paint-time
+        overlay), so the document itself - and therefore the colour detection
+        in process_content() - is left untouched."""
+        cursor = QTextCursor(self.preview_area.document())
+        cursor.select(QTextCursor.SelectionType.Document)
+        selection = QTextEdit.ExtraSelection()
+        selection.cursor = cursor
+        selection.format.setForeground(QColor(PREVIEW_TEXT_COLOR))
+        self.preview_area.setExtraSelections([selection])
  
     def load_file(self):
         """Loads a .docx or .pptx file and processes it accordingly"""
@@ -329,6 +386,7 @@ class DocumentToHtmlConverter(QMainWindow):
         return html_output
  
     def paste_from_clipboard(self):
+        self.preview_area.clear()
         self.preview_area.paste()
  
     def copy_result(self):
@@ -519,8 +577,18 @@ class DocumentToHtmlConverter(QMainWindow):
         # --- Step 3: Build clean output — keep <a>, <b>, <i>, <u> ---
         # (plus colour spans created above, when the colour option is enabled)
         KEEP_TAGS = {'a', 'b', 'i', 'u', 'sub', 'sup'}
-        result_text = ""
-        for block in body.find_all(['p', 'div', 'li', 'h1', 'h2', 'h3']):
+        BLOCK_TAGS = ['p', 'div', 'li', 'h1', 'h2', 'h3']
+        parts = []
+        for block in body.find_all(BLOCK_TAGS):
+            # Empty line (Qt: <p><br></p>) -> <br><br> (optional feature).
+            # Only leaf paragraphs count, so wrappers around real content
+            # never produce a stray <br><br>.
+            if (self.empty_line_br and block.name in ('p', 'div')
+                    and not block.get_text(strip=True)
+                    and not block.find(BLOCK_TAGS)):
+                parts.append(EMPTY_LINE_HTML)
+                continue
+
             # If the WHOLE paragraph has one colour, the colour is moved from
             # the <span>s to the paragraph itself: <p style="color:#...">...</p>.
             # Mixed/partial colouring keeps inline <span>s (a <p> can't be
@@ -541,12 +609,27 @@ class DocumentToHtmlConverter(QMainWindow):
             if block_html:
                 if paragraph_style:
                     block_html = f'<p style="{html.escape(paragraph_style, quote=True)}">{block_html}</p>'
-                result_text += block_html + "\n\n"
+                parts.append(block_html)
 
-        self.result_area.setPlainText(result_text.strip())
+        # Empty lines at the very start / end of the text are not content
+        while parts and parts[0] == EMPTY_LINE_HTML:
+            parts.pop(0)
+        while parts and parts[-1] == EMPTY_LINE_HTML:
+            parts.pop()
+
+        self.result_area.setPlainText("\n\n".join(parts))
  
 if __name__ == "__main__":
+    # Windows: own AppUserModelID, so the taskbar shows our icon instead of python's
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Links2HTML.Links2HTML")
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
+    app.setWindowIcon(load_app_icon())  # main window, dialogs and message boxes
     window = DocumentToHtmlConverter()
     window.show()
     sys.exit(app.exec())
